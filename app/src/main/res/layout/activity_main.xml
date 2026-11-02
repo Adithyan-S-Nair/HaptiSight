@@ -20,7 +20,7 @@
         android:paddingTop="12dp"
         android:paddingEnd="16dp"
         android:paddingBottom="12dp"
-        android:text="🟢 INITIALIZING CAMERA..."
+        android:text="🔄 INITIALIZING CAMERA..."
         android:textColor="#FFFFFF"
         android:textSize="15sp"
         android:textStyle="bold"

@@ -72,16 +72,13 @@ class CameraBackgroundRenderer {
     /**
      * Initializes OpenGL textures and compiles OES shaders.
      * Must be called on the GL thread (e.g. in onSurfaceCreated).
+     *
+     * Note: When a new EGL context is created, previous texture and program handles
+     * are already invalidated by the driver. We reset handle state to ensure clean allocation.
      */
     fun createOnGlThread() {
-        if (textureId != -1) {
-            GLES20.glDeleteTextures(1, intArrayOf(textureId), 0)
-            textureId = -1
-        }
-        if (program != 0) {
-            GLES20.glDeleteProgram(program)
-            program = 0
-        }
+        textureId = -1
+        program = 0
 
         val textures = IntArray(1)
         GLES20.glGenTextures(1, textures, 0)

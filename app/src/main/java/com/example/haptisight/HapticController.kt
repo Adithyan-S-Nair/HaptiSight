@@ -167,8 +167,12 @@ class HapticController(context: Context) {
             return "⚠️ DEPTH UNAVAILABLE"
         }
 
-        if (result.lowConfidence) {
-            return "⚠️ LOW DEPTH CONFIDENCE"
+        if (result.lowConfidence || !result.isSafePath) {
+            return if (result.bannerText.isNotEmpty() && result.bannerText != "🟢 SAFE PATH") {
+                result.bannerText
+            } else {
+                "⚠️ LOW DEPTH CONFIDENCE"
+            }
         }
         return "🟢 SAFE PATH"
     }

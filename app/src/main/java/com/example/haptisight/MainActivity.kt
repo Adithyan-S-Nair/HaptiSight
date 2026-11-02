@@ -52,6 +52,7 @@ class MainActivity : AppCompatActivity(), GLSurfaceView.Renderer {
     private var lastAnalysisTime: Long = 0L
     private var lastFrameTimestamp: Long = 0L
     private var lastValidDepthTimestamp: Long = 0L
+    private var sessionResumeTimestamp: Long = 0L
     private var skipFrames: Int = 0
 
     private var viewportWidth = 0
@@ -63,7 +64,7 @@ class MainActivity : AppCompatActivity(), GLSurfaceView.Renderer {
     ) { isGranted ->
         if (isGranted) {
             runOnUiThread {
-                statusBanner.text = "🟢 CAMERA READY - INITIALIZING..."
+                statusBanner.text = "🔄 CAMERA READY - INITIALIZING..."
             }
             resumeSession()
         } else {
@@ -106,6 +107,7 @@ class MainActivity : AppCompatActivity(), GLSurfaceView.Renderer {
 
     override fun onResume() {
         super.onResume()
+        sessionResumeTimestamp = SystemClock.elapsedRealtime()
         lastValidDepthTimestamp = 0L
         lastAnalysisTime = 0L
         lastFrameTimestamp = 0L
@@ -123,6 +125,7 @@ class MainActivity : AppCompatActivity(), GLSurfaceView.Renderer {
 
     private fun resumeSession() {
         var message: String? = null
+        sessionResumeTimestamp = SystemClock.elapsedRealtime()
 
         if (session == null) {
             try {
@@ -194,7 +197,7 @@ class MainActivity : AppCompatActivity(), GLSurfaceView.Renderer {
             session?.resume()
             glSurfaceView.onResume()
             runOnUiThread {
-                statusBanner.text = "🟢 SCANNING..."
+                statusBanner.text = "🔄 INITIALIZING DEPTH..."
             }
         } catch (e: CameraNotAvailableException) {
             Log.e("HaptiSight", "Camera not available", e)
@@ -268,6 +271,8 @@ class MainActivity : AppCompatActivity(), GLSurfaceView.Renderer {
         val camera = frame.camera
         if (camera.trackingState != TrackingState.TRACKING) {
             hapticController.stopAll()
+            lastValidDepthTimestamp = 0L
+            depthAnalyzer.reset()
             val failureReason = camera.trackingFailureReason
             val trackingMessage = when (failureReason) {
                 TrackingFailureReason.INSUFFICIENT_LIGHT -> "⚠️ TRACKING PAUSED - TOO DARK"
@@ -300,8 +305,10 @@ class MainActivity : AppCompatActivity(), GLSurfaceView.Renderer {
         // 5. Throttle depth analysis to once every 60ms (~16 FPS) for instantaneous zero-lag response
         val now = SystemClock.elapsedRealtime()
         if (now - lastAnalysisTime < 60L) {
-            // Check stale depth timeout (800ms)
-            if (lastValidDepthTimestamp > 0L && (now - lastValidDepthTimestamp > 800L)) {
+            // Check stale depth timeout (800ms) or initial depth acquisition timeout (800ms)
+            val isDepthStale = (lastValidDepthTimestamp > 0L && (now - lastValidDepthTimestamp > 800L)) ||
+                    (lastValidDepthTimestamp == 0L && (now - sessionResumeTimestamp > 800L))
+            if (isDepthStale) {
                 hapticController.stopAll()
                 runOnUiThread {
                     overlayView.clear()
@@ -317,14 +324,14 @@ class MainActivity : AppCompatActivity(), GLSurfaceView.Renderer {
         // 6. Synchronous Hybrid Depth Analysis on GLThread (< 1.5ms)
         try {
             val result = depthAnalyzer.analyze(frame)
-            if (!result.isDepthUnavailable && !result.lowConfidence) {
+            if (!result.isDepthUnavailable && !result.lowConfidence && (result.isSafePath || result.boxes.isNotEmpty())) {
                 lastValidDepthTimestamp = now
             }
             val bannerText = hapticController.onDetectionUpdated(result)
             val boxesCopy = result.boxes.toList()
 
             runOnUiThread {
-                if (result.isDepthUnavailable || result.lowConfidence) {
+                if (result.isDepthUnavailable || result.lowConfidence || (!result.isSafePath && result.boxes.isEmpty())) {
                     overlayView.clear()
                 } else {
                     overlayView.setDetectionResult(boxesCopy)
@@ -337,7 +344,9 @@ class MainActivity : AppCompatActivity(), GLSurfaceView.Renderer {
             skipFrames = 2
         } catch (e: Exception) {
             Log.e("HaptiSight", "Depth frame processing exception", e)
-            if (now - lastValidDepthTimestamp > 800L || lastValidDepthTimestamp == 0L) {
+            val isDepthStale = (lastValidDepthTimestamp > 0L && (now - lastValidDepthTimestamp > 800L)) ||
+                    (lastValidDepthTimestamp == 0L && (now - sessionResumeTimestamp > 800L))
+            if (isDepthStale) {
                 hapticController.stopAll()
                 runOnUiThread {
                     overlayView.clear()

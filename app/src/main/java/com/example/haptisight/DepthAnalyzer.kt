@@ -276,6 +276,31 @@ class DepthAnalyzer {
                     }
                 }
             }
+        } else if (hasDense) {
+            // Independent Dense Depth scanning when raw depth is unavailable
+            val denseW = denseDepthImage!!.width
+            val denseH = denseDepthImage.height
+            ensureCapacity(denseW * denseH)
+
+            val densePlane = denseDepthImage.planes[0]
+            val denseBuffer = densePlane.buffer.order(ByteOrder.LITTLE_ENDIAN)
+            val denseRowStride = densePlane.rowStride
+            val densePixelStride = densePlane.pixelStride
+
+            for (row in 0 until denseH step STRIDE) {
+                val depthRowOffset = row * denseRowStride
+                for (col in 0 until denseW step STRIDE) {
+                    val normY = col.toFloat() / denseW.toFloat()
+                    if (normY in ROI_Y_MIN..ROI_Y_MAX) {
+                        totalRoiPixels++
+                        val depthIndex = depthRowOffset + col * densePixelStride
+                        val depthMm = denseBuffer.getShort(depthIndex).toInt() and 0xFFFF
+                        if (depthMm in MIN_DEPTH_MM..MAX_DEPTH_MM) {
+                            validRoiPixels++
+                        }
+                    }
+                }
+            }
         }
 
         // Per-Zone Independent Evaluation: Case A (Raw Depth) or Case B (Dense Depth Fallback)
