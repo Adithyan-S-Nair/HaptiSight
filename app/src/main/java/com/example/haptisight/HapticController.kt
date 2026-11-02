@@ -156,11 +156,15 @@ class HapticController(context: Context) {
             return "🟡 SINGLE OBJECT - SHORT BUZZ"
         }
 
-        // 3. SAFE STATE: Only Green boxes (> 1200 mm) or clear path
-        // Immediately call cancel() once on transition to safe state and NEVER vibrate.
+        // 3. SAFE / UNCERTAIN STATE: Only Green boxes (> 1200 mm), clear path, or non-obstacle fallback
+        // Immediately call cancel() once on transition and NEVER vibrate.
         if (lastState != HapticState.SAFE) {
             cancel()
             lastState = HapticState.SAFE
+        }
+
+        if (result.isDepthUnavailable) {
+            return "⚠️ DEPTH UNAVAILABLE"
         }
 
         if (result.lowConfidence) {

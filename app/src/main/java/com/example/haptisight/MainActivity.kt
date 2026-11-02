@@ -23,6 +23,8 @@ import com.google.ar.core.CameraConfig
 import com.google.ar.core.CameraConfigFilter
 import com.google.ar.core.Config
 import com.google.ar.core.Session
+import com.google.ar.core.TrackingFailureReason
+import com.google.ar.core.TrackingState
 import com.google.ar.core.exceptions.CameraNotAvailableException
 import com.google.ar.core.exceptions.ResourceExhaustedException
 import com.google.ar.core.exceptions.UnavailableApkTooOldException
@@ -83,9 +85,6 @@ class MainActivity : AppCompatActivity(), GLSurfaceView.Renderer {
         muteButton = findViewById(R.id.muteButton)
         hapticController = HapticController(this)
 
-        // Initial launch test pulse to verify hardware vibration
-        hapticController.triggerTestPulse()
-
         muteButton.setOnClickListener {
             hapticController.isMuted = !hapticController.isMuted
             if (hapticController.isMuted) {
@@ -107,6 +106,10 @@ class MainActivity : AppCompatActivity(), GLSurfaceView.Renderer {
 
     override fun onResume() {
         super.onResume()
+        lastValidDepthTimestamp = 0L
+        lastAnalysisTime = 0L
+        lastFrameTimestamp = 0L
+        skipFrames = 0
         hapticController.startSession()
         depthAnalyzer.reset()
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA)
@@ -204,14 +207,16 @@ class MainActivity : AppCompatActivity(), GLSurfaceView.Renderer {
 
     override fun onPause() {
         super.onPause()
-        hapticController.cancel()
+        hapticController.stopAll()
         glSurfaceView.onPause()
         session?.pause()
+        overlayView.clear()
+        lastValidDepthTimestamp = 0L
     }
 
     override fun onDestroy() {
         super.onDestroy()
-        hapticController.cancel()
+        hapticController.stopAll()
         session?.close()
         session = null
     }
@@ -259,44 +264,71 @@ class MainActivity : AppCompatActivity(), GLSurfaceView.Renderer {
         // 1. Draw camera feed onto full-screen surface with zero black bars (smooth 60 FPS)
         backgroundRenderer.draw(frame)
 
-        // 2. Recovery check after ResourceExhaustedException
+        // 2. Camera Tracking State Check (State 5: Camera/Tracking Error)
+        val camera = frame.camera
+        if (camera.trackingState != TrackingState.TRACKING) {
+            hapticController.stopAll()
+            val failureReason = camera.trackingFailureReason
+            val trackingMessage = when (failureReason) {
+                TrackingFailureReason.INSUFFICIENT_LIGHT -> "⚠️ TRACKING PAUSED - TOO DARK"
+                TrackingFailureReason.EXCESSIVE_MOTION -> "⚠️ TRACKING PAUSED - MOVING TOO FAST"
+                TrackingFailureReason.INSUFFICIENT_FEATURES -> "⚠️ TRACKING PAUSED - POOR TEXTURE"
+                TrackingFailureReason.CAMERA_UNAVAILABLE -> "⚠️ CAMERA UNAVAILABLE"
+                TrackingFailureReason.BAD_STATE -> "⚠️ TRACKING ERROR"
+                else -> "⚠️ TRACKING PAUSED - MOVE PHONE SLOWLY"
+            }
+            runOnUiThread {
+                overlayView.clear()
+                statusBanner.text = trackingMessage
+            }
+            return
+        }
+
+        // 3. Recovery check after ResourceExhaustedException
         if (skipFrames > 0) {
             skipFrames--
             return
         }
 
-        // 3. Frame Change Check (only analyze when camera frame changes)
+        // 4. Frame Change Check (only analyze when camera frame changes)
         val frameTimestamp = frame.timestamp
         if (frameTimestamp == lastFrameTimestamp) {
             return
         }
         lastFrameTimestamp = frameTimestamp
 
-        // 4. Throttle depth analysis to once every 60ms (~16 FPS) for instantaneous zero-lag response
+        // 5. Throttle depth analysis to once every 60ms (~16 FPS) for instantaneous zero-lag response
         val now = SystemClock.elapsedRealtime()
         if (now - lastAnalysisTime < 60L) {
             // Check stale depth timeout (800ms)
-            if (now - lastValidDepthTimestamp > 800L) {
-                if (hapticController.checkWatchdog()) {
-                    runOnUiThread {
-                        overlayView.clear()
-                        statusBanner.text = "🟢 SAFE PATH"
-                    }
+            if (lastValidDepthTimestamp > 0L && (now - lastValidDepthTimestamp > 800L)) {
+                hapticController.stopAll()
+                runOnUiThread {
+                    overlayView.clear()
+                    statusBanner.text = "⚠️ DEPTH UNAVAILABLE"
                 }
+            } else {
+                hapticController.checkWatchdog()
             }
             return
         }
         lastAnalysisTime = now
 
-        // 5. Synchronous Hybrid Depth Analysis on GLThread (< 1.5ms)
+        // 6. Synchronous Hybrid Depth Analysis on GLThread (< 1.5ms)
         try {
             val result = depthAnalyzer.analyze(frame)
-            lastValidDepthTimestamp = now
+            if (!result.isDepthUnavailable && !result.lowConfidence) {
+                lastValidDepthTimestamp = now
+            }
             val bannerText = hapticController.onDetectionUpdated(result)
             val boxesCopy = result.boxes.toList()
 
             runOnUiThread {
-                overlayView.setDetectionResult(boxesCopy)
+                if (result.isDepthUnavailable || result.lowConfidence) {
+                    overlayView.clear()
+                } else {
+                    overlayView.setDetectionResult(boxesCopy)
+                }
                 statusBanner.text = bannerText
             }
         } catch (e: ResourceExhaustedException) {
@@ -305,11 +337,11 @@ class MainActivity : AppCompatActivity(), GLSurfaceView.Renderer {
             skipFrames = 2
         } catch (e: Exception) {
             Log.e("HaptiSight", "Depth frame processing exception", e)
-            if (now - lastValidDepthTimestamp > 800L) {
+            if (now - lastValidDepthTimestamp > 800L || lastValidDepthTimestamp == 0L) {
                 hapticController.stopAll()
                 runOnUiThread {
                     overlayView.clear()
-                    statusBanner.text = "🟢 SAFE PATH"
+                    statusBanner.text = "⚠️ DEPTH UNAVAILABLE"
                 }
             }
         }

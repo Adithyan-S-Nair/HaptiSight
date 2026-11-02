@@ -74,6 +74,15 @@ class CameraBackgroundRenderer {
      * Must be called on the GL thread (e.g. in onSurfaceCreated).
      */
     fun createOnGlThread() {
+        if (textureId != -1) {
+            GLES20.glDeleteTextures(1, intArrayOf(textureId), 0)
+            textureId = -1
+        }
+        if (program != 0) {
+            GLES20.glDeleteProgram(program)
+            program = 0
+        }
+
         val textures = IntArray(1)
         GLES20.glGenTextures(1, textures, 0)
         textureId = textures[0]

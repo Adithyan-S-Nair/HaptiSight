@@ -2,7 +2,6 @@ package com.example.haptisight
 
 import android.media.Image
 import android.util.Log
-import androidx.core.graphics.toColorInt
 import com.google.ar.core.Frame
 import com.google.ar.core.exceptions.NotYetAvailableException
 import java.nio.ByteBuffer
@@ -38,6 +37,7 @@ data class DepthAnalysisResult(
     val totalRoiPixels: Int,
     val validRoiPixels: Int,
     val lowConfidence: Boolean,
+    val isDepthUnavailable: Boolean = false,
     val bannerText: String
 )
 
@@ -49,9 +49,9 @@ data class DepthAnalysisResult(
 class DepthAnalyzer {
 
     companion object {
-        val COLOR_RED: Int = "#FF1744".toColorInt()
-        val COLOR_YELLOW: Int = "#FFD600".toColorInt()
-        val COLOR_GREEN: Int = "#00E676".toColorInt()
+        const val COLOR_RED: Int = 0xFFFF1744.toInt()
+        const val COLOR_YELLOW: Int = 0xFFFFD600.toInt()
+        const val COLOR_GREEN: Int = 0xFF00E676.toInt()
 
         private const val MIN_DEPTH_MM = 200 // Expanded search window
         private const val MAX_DEPTH_MM = 5000 // Expanded search window
@@ -178,6 +178,26 @@ class DepthAnalyzer {
 
         val hasRaw = (rawDepthImage != null && confImage != null &&
                 rawDepthImage.planes.isNotEmpty() && confImage.planes.isNotEmpty())
+        val hasDense = (denseDepthImage != null && denseDepthImage.planes.isNotEmpty())
+
+        if (!hasRaw && !hasDense) {
+            return DepthAnalysisResult(
+                boxes = emptyList(),
+                leftDMin = null,
+                centerDMin = null,
+                rightDMin = null,
+                isRedBarrier = false,
+                mergedRedDMin = null,
+                isDoorway = false,
+                yellowDMin = null,
+                isSafePath = false,
+                totalRoiPixels = 0,
+                validRoiPixels = 0,
+                lowConfidence = false,
+                isDepthUnavailable = true,
+                bannerText = "⚠️ DEPTH UNAVAILABLE"
+            )
+        }
 
         if (hasRaw) {
             rawW = rawDepthImage!!.width
@@ -379,14 +399,18 @@ class DepthAnalyzer {
 
         val hasObstacle = isRedBarrier || yellowDMin != null
         val hasAnyBoxes = boxes.isNotEmpty()
-        val lowConfidence = !hasAnyBoxes && totalRoiPixels > 0 && ((validRoiPixels.toFloat() / totalRoiPixels.toFloat()) < 0.03f)
-        val isSafePath = !hasObstacle
+        val isDepthUnavailable = (totalRoiPixels == 0 && !hasAnyBoxes)
+        val lowConfidence = !isDepthUnavailable && !hasAnyBoxes &&
+                (totalRoiPixels > 0 && ((validRoiPixels.toFloat() / totalRoiPixels.toFloat()) < 0.03f || validRoiPixels < 8))
+        val isSafePath = !hasObstacle && !isDepthUnavailable && !lowConfidence && (hasAnyBoxes || validRoiPixels >= 15)
 
         val bannerText = when {
             isRedBarrier -> "🔴 WIDE BARRIER - LONG BUZZ"
             yellowDMin != null -> "🟡 SINGLE OBJECT - SHORT BUZZ"
+            isDepthUnavailable -> "⚠️ DEPTH UNAVAILABLE"
             lowConfidence -> "⚠️ LOW DEPTH CONFIDENCE"
-            else -> "🟢 SAFE PATH"
+            isSafePath -> "🟢 SAFE PATH"
+            else -> "⚠️ LOW DEPTH CONFIDENCE"
         }
 
         return DepthAnalysisResult(
@@ -402,6 +426,7 @@ class DepthAnalyzer {
             totalRoiPixels = totalRoiPixels,
             validRoiPixels = validRoiPixels,
             lowConfidence = lowConfidence,
+            isDepthUnavailable = isDepthUnavailable,
             bannerText = bannerText
         )
     }
