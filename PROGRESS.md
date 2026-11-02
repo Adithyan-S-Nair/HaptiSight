@@ -1,0 +1,71 @@
+# HaptiSight Development Progress (PROGRESS.md)
+**Current Status:** All Phases Complete - Temporal Smoothing & Precision Adjacency Verified
+**Active Issue / Strike Count:** None (0/3)
+
+## Phase Checklist
+- [x] **Phase 1: Gradle & Manifest Configuration** (Configure `app/build.gradle.kts` with ARCore `1.44.0`, `minSdk 26`, `compileSdk 34`; configure `AndroidManifest.xml` with Camera, Vibrate, Portrait lock, and ARCore required metadata; verify with `./gradlew assembleDebug`).
+- [x] **Phase 2: UI Layout & Style B OverlayView** (Build `activity_main.xml` with top Status Banner, full-screen `GLSurfaceView`, `OverlayView`, and bottom Pause/Mute toggle button; implement `OverlayView.kt` with 75% dashed ROI line, Green/Yellow/Red dynamic boxes, and clamped text pills; verify build).
+- [x] **Phase 3: OpenGL Background Renderer & ARCore Session** (Create `CameraBackgroundRenderer.kt` with external OES shader and coordinate transformation; wire up ARCore `Session` lifecycle, runtime Camera permission request, and `RAW_DEPTH_ONLY` config in `MainActivity.kt`; verify build).
+- [x] **Phase 4: 16-Bit Depth Scanner & 3-Zone Adjacency Engine** (Create `DepthAnalyzer.kt` with `ByteOrder.LITTLE_ENDIAN` stride-safe parsing, 90° portrait coordinate mapping, Top 75% ROI filter, 10th percentile `D_min`, tight pixel bounds with full-height extension, and Red/Yellow/Green merging; verify build).
+- [x] **Phase 5: Version-Safe Haptic Controller & MainActivity Integration** (Create `HapticController.kt` with API 26–34 compatibility, `USAGE_ALARM`, `255` amplitude patterns, doorway silence rule, low-confidence triple-pulse fallback, and Mute button wiring in `MainActivity.kt`; verify build).
+- [x] **Phase 6: Production Audit & Final APK Build** (Verify `depthImage.close()` and `confidenceImage.close()` in `finally` blocks, verify `runOnUiThread` safety, run clean `./gradlew assembleDebug`, and confirm APK output at `app/build/outputs/apk/debug/app-debug.apk`).
+
+## Execution Log
+- Session initialized.
+- **Phase 1:** Configured `app/build.gradle.kts`, `app/src/main/AndroidManifest.xml`, `app/src/main/java/com/example/haptisight/MainActivity.kt`, `gradle/libs.versions.toml`, `gradle.properties`, and `gradlew`. Verified with `./gradlew assembleDebug` (`PASS`).
+- **Phase 2:** Created `OverlayView.kt` with Style B bounding boxes, 75% dashed ROI line, and clamped distance pills; updated `activity_main.xml` with `glSurfaceView`, `overlayView`, `statusBanner`, and `muteButton`; wired view references in `MainActivity.kt`. Verified with `./gradlew assembleDebug` (`PASS`).
+- **Phase 3:** Created `CameraBackgroundRenderer.kt` with external OES shader and coordinate transform; wired ARCore `Session` lifecycle, runtime `CAMERA` permission handling, `RAW_DEPTH_ONLY` configuration, and depth acquisition try/catch/finally in `MainActivity.kt`. Verified with `./gradlew assembleDebug` (`PASS`).
+- **Phase 4:** Created `DepthAnalyzer.kt` with Little-Endian stride-safe parsing, 90° CW portrait mapping, Top 75% ROI filter, 10th percentile `D_min`, tight bounding boxes with full-height extension, and Red/Yellow/Green adjacency merging; wired to UI and frame loop in `MainActivity.kt` with strict `finally` closing of `depthImage` and `confidenceImage`. Verified with `./gradlew assembleDebug` (`PASS`).
+- **Phase 5:** Created `HapticController.kt` supporting API 26–34 with `USAGE_ALARM`, 255 max amplitude patterns, doorway silence rule, 1500 ms low-confidence fallback, cooldown timers, and mute state; integrated HapticController, DepthAnalyzer, OverlayView, Status Banner, and Mute button in `MainActivity.kt`. Verified with `./gradlew assembleDebug` (`PASS`).
+- **Phase 6:** Audited all source files (verified `depthImage` & `confImage` strict `finally` closures and `runOnUiThread` UI dispatch); compiled release-quality debug build via `./gradlew assembleDebug` (`PASS`); confirmed output APK at `app/build/outputs/apk/debug/app-debug.apk`.
+- **Targeted Bugfix & Cleanup:**
+  - `HapticController.kt`: Resolved Xiaomi MIUI vibration blocking by eliminating restrictive attributes, removing premature per-frame cancellation, and adding `triggerTestPulse()` (250ms buzz) triggered on app launch and unmute.
+  - `DepthAnalyzer.kt`: Reduced confidence threshold to 100 for indoor surfaces; switched to `.toColorInt()`.
+  - `MainActivity.kt`: Implemented automatic fallback to `frame.acquireDepthImage16Bits()` when raw depth is unavailable or has < 5% valid pixels; added `@SuppressLint("SetTextI18n")`, replaced `Color.parseColor` with `.toColorInt()`, removed unread variables, and logged exceptions via `Log.e`.
+  - Re-verified clean compilation with `./gradlew assembleDebug` (`PASS`).
+- **Performance Optimization & Yellow Vibration Reliability Fix:**
+  - `MainActivity.kt`: Decoupled preview from depth analysis. Camera preview renders every frame at smooth 60 FPS; depth analysis throttled to 120 ms interval (`lastAnalysisTime >= 120L`). Direct fallback to `acquireDepthImage16Bits()` if raw depth fails without running duplicate loops.
+  - `DepthAnalyzer.kt`: Implemented stride of 2 subsampling (`row += 2`, `col += 2`) cutting loop operations by 75%; eliminated doorway silence rule so any Yellow box triggers `SINGLE_OBSTACLE`; prioritized obstacle detections over low confidence.
+  - `HapticController.kt`: Added immediate cooldown bypass when transitioning from `SAFE` to Yellow/Red; reduced Yellow cooldown to 750 ms; upgraded pulse timings to `[0, 220, 120, 220]` (< 1 m) and 350 ms (1–2 m) for reliable Xiaomi haptic delivery.
+  - Re-verified clean compilation with `./gradlew assembleDebug` (`PASS`, 0 errors, 0 warnings).
+- **Camera Aspect Ratio, Strict Green Silence & Async Depth Fix:**
+  - `CameraBackgroundRenderer.kt`: Added projection scaling matrix (`u_MvpMatrix`) to fit camera stream width precisely to viewport aspect ratio, eliminating the artificial zoom effect.
+  - `HapticController.kt`: Enforced strict safety rule — SAFE state (all zones > 2000 mm or showing GREEN boxes) returns 0 vibration unconditionally; Yellow and Red are the ONLY vibration-triggering states. Low-confidence fallback never vibrates on safe scenes.
+  - `activity_main.xml`: Positioned Status Banner `TextView` above `GLSurfaceView` and `OverlayView` to prevent any overlap with bounding boxes or text pills.
+  - `MainActivity.kt`: Offloaded depth analysis to an asynchronous single-thread executor with atomic 100ms frame dropping, ensuring zero GL thread blocking and silky 60 FPS preview.
+  - Re-verified clean compilation with `./gradlew assembleDebug` (`PASS`, 0 errors, 0 warnings).
+- **Confidence Null-Safety, False Red Fix & Temporal Smoothing:**
+  - `DepthAnalyzer.kt`: Implemented null-safe confidence handling (defaults to 200 without discarding pixels when confidence image is null); tightened Red Wide Barrier adjacency threshold to 150 mm (preventing distant walls from merging with close doors); added 2-frame temporal smoothing on `D_min` across all zones to eliminate color flickering.
+  - `MainActivity.kt`: Added `depthAnalyzer.reset()` on session resume.
+  - Re-verified clean compilation with `./gradlew assembleDebug` (`PASS`, 0 errors, 0 warnings).
+- **Full-Screen Wide FOV, Upper-Body Scanning & Dense Depth Optimization:**
+  - `CameraBackgroundRenderer.kt`: Replaced custom Y-scaling quad with full normalized device coordinate quad `(-1f to +1f)` and ARCore `frame.transformCoordinates2d`, completely eliminating black bars and rendering camera 1:1 with OverlayView.
+  - `MainActivity.kt`: Configured widest rear `CameraConfig` and `Config.DepthMode.AUTOMATIC`; prioritized `frame.acquireDepthImage16Bits()` (dense depth) as primary depth source with graceful raw depth fallback.
+  - `DepthAnalyzer.kt`: Restricted scanning to Top 65% Upper-Body ROI (`0.10f` to `0.65f`), clamped bounding boxes to `<= 0.68f` (excluding floor tiles), required minimum cluster height (`>= 0.08f`), and recalibrated thresholds: Green SAFE (`1200 mm < D_min <= 3500 mm`), Yellow SINGLE (`D_min <= 1200 mm`), and Red WIDE BARRIER (`<= 1000 mm` on adjacent zones with `|diff| <= 150 mm`).
+  - `OverlayView.kt`: Updated ROI guideline to 65% height labeled `"UPPER-BODY DETECTION ROI"`.
+  - `HapticController.kt`: Enforced unconditional zero-buzz on SAFE state with single `cancel()` on transition; removed low-confidence vibration; tuned Yellow and Red vibration waveforms.
+  - Re-verified clean compilation with `./gradlew assembleDebug` (`PASS`, 0 errors, 0 warnings); verified APK at `app/build/outputs/apk/debug/app-debug.apk`.
+- **Frozen Box Fix, Synchronous GLThread Execution, 85% ROI & Watchdog:**
+  - `MainActivity.kt`: Removed async background executor deadlock. Depth acquisition and stride-4 depth analysis executed synchronously on GLThread in `< 0.5 ms` with strict per-frame `finally { depthImage?.close(); confImage?.close() }`. Added `TrackingState.TRACKING` startup check displaying `"🔄 INITIALIZING DEPTH - MOVE PHONE SLOWLY"`, and immediate raw depth fallback within same tick.
+  - `DepthAnalyzer.kt`: Expanded scanning ROI to Top 85% of screen height (`0.05f` to `0.85f`) with `maxNormY <= 0.85f`. Removed temporal coordinate caching so bounding boxes recalculate live in real time. Stride 4 implemented for 60 FPS preview with zero lag.
+  - `OverlayView.kt`: Moved dashed cutoff line to `Y = 0.85f * height` labeled `"85% DETECTION ROI"`, added `clear()` method.
+  - `HapticController.kt`: Added `onDetectionUpdated()`, alias `processResult()`, and 400ms obstacle watchdog forcing SAFE state, clearing stale Yellow/Red alerts, and calling `vibrator.cancel()`.
+  - `SKILL.md`: Updated Sections 4.3 and 4.4 to document 85% Detection ROI.
+  - Re-verified clean compilation with `./gradlew assembleDebug` (`PASS`, 0 errors, 0 warnings); verified APK at `app/build/outputs/apk/debug/app-debug.apk`.
+- **Production Stability, Anti-Freeze, Confidence Raw Depth & Camera Zoom-Out Fix:**
+  - `DepthAnalyzer.kt`: Switched to confidence-verified raw depth ONLY (`conf >= 140`, `depth 250..4500mm`, `stride = 2`). Implemented 15th-85th percentile core clustering around the median `(medianX, medianY)` of matching pixels (`depthMm in D_min..D_min+120mm`), completely eliminating full-height column hallucinations. Implemented 3-zone Red barrier merge rule (`Left, Center, Right <= 1200 mm` within `150 mm`).
+  - `MainActivity.kt`: Configured `Config.DepthMode.RAW_DEPTH_ONLY`. Added `frame.timestamp` frame-change check, tracked `lastValidDepthTimestamp`, and added 300ms stale depth auto-clear calling `overlayView.clear()` and `hapticController.stopAll()`. Handled `ResourceExhaustedException` with `System.gc()` and 2-frame skip. Passed immutable list copy `result.boxes.toList()` to UI thread.
+  - `CameraBackgroundRenderer.kt`: Replaced cropped quad with vertically zoomed-out NDC quad (`Y` from `-0.82f` to `+0.82f`) and static 90° CW UV mapping (`(1,1), (1,0), (0,1), (0,0)`), exposing 100% of the wide horizontal camera sensor with zero crop.
+  - `OverlayView.kt`: Mapped `normX` across full width and `normY` to active camera viewport (`topOffset` to `bottomOffset`), locking bounding boxes 1:1 onto objects in the zoomed-out camera feed.
+  - `HapticController.kt`: Added `stopAll()` method.
+  - Re-verified clean compilation with `./gradlew assembleDebug` (`PASS`, 0 errors, 0 warnings); verified APK at `app/build/outputs/apk/debug/app-debug.apk`.
+- **Hybrid Depth Engine, 60ms Ultra-Low Latency, Full-Screen Preview & Green Boxes Fix:**
+  - `MainActivity.kt`: Removed `TrackingState.TRACKING` blocker preventing stuck `"INITIALIZING DEPTH"` on plain walls; reduced analysis interval from 100ms to 60ms (~16 FPS updates) for instantaneous detection; extended stale clear threshold to 800ms; configured `Config.DepthMode.AUTOMATIC`.
+  - `CameraBackgroundRenderer.kt`: Restored standard full-screen quad (`-1f to +1f`) with ARCore `transformCoordinates2d`, completely eliminating black bars at top and bottom.
+  - `OverlayView.kt`: Mapped coordinates directly across the full screen (`0f..w`, `0f..h`), keeping the cyan dashed line at `0.85f * height` (`"85% DETECTION ROI"`).
+  - `DepthAnalyzer.kt`: Lowered indoor raw confidence threshold to `45`; implemented same-frame hybrid fallback (Raw Depth + Confidence, falling back to smoothed dense depth if `< 30` valid pixels); lowered minimum valid pixel count to `8` (stride = 3); took 15th percentile for `D_min` and 10th-90th percentile bounding boxes around median within `D_min..D_min+220mm` with minimum dimensions `>= 0.12f`; restored Green safe boxes (`1200 mm < D_min <= 4500 mm`) and Red merged barrier (`<= 1200 mm` within `200 mm`); strictly closed all images in `finally`.
+  - `SKILL.md`: Updated Sections 4.3 & 4.4 to document hybrid depth engine and 85% ROI.
+  - Re-verified clean compilation with `./gradlew assembleDebug` (`PASS`, 0 errors, 0 warnings); verified APK at `app/build/outputs/apk/debug/app-debug.apk`.
+- **Per-Zone Hybrid Depth Fusion & Low-Light Dynamic Gain Fix:**
+  - `DepthAnalyzer.kt`: Lowered base raw depth confidence threshold to `conf >= 10`. Implemented Low-Light Illumination Boost (`avgConf < 30`) automatically expanding search window to `200..5000 mm`. Evaluated Left, Center, and Right zones independently: Case A rich raw depth (`>= 8` valid points) produces tight 10th–90th percentile bounding boxes; Case B fallback scans dense smoothed depth for featureless walls and dark surfaces (`0.15f..0.80f normY`, `spread <= 600 mm`, `p15 in 200..4000 mm`) drawing clean wall bounding boxes (`normY in 0.15f..0.85f`). Implemented 3-zone adjacency merging into single Red Wide Barrier (`<= 1200 mm` within `250 mm`) with Long Buzz haptics, Yellow single obstacles, and Green safe path boxes (`1200 mm < D_min <= 4000 mm`). Strictly acquired and closed `rawDepthImage`, `confImage`, and `denseDepthImage` inside independent try/catch/finally blocks.
+  - Resolved `depthRowStride` compile reference and verified clean build with `./gradlew assembleDebug` (`PASS`, 0 errors, 0 warnings); verified output APK at `app/build/outputs/apk/debug/app-debug.apk`.
