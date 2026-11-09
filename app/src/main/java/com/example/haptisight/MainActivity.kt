@@ -32,6 +32,7 @@ import com.google.ar.core.exceptions.UnavailableArcoreNotInstalledException
 import com.google.ar.core.exceptions.UnavailableDeviceNotCompatibleException
 import com.google.ar.core.exceptions.UnavailableSdkTooOldException
 import com.google.ar.core.exceptions.UnavailableUserDeclinedInstallationException
+import java.util.EnumSet
 import javax.microedition.khronos.egl.EGLConfig
 import javax.microedition.khronos.opengles.GL10
 
@@ -41,8 +42,10 @@ class MainActivity : AppCompatActivity(), GLSurfaceView.Renderer {
     private lateinit var glSurfaceView: GLSurfaceView
     private lateinit var overlayView: OverlayView
     private lateinit var statusBanner: TextView
+    private lateinit var bleStatusBadge: TextView
     private lateinit var muteButton: MaterialButton
     private lateinit var hapticController: HapticController
+    private lateinit var bleGloveController: BleGloveController
 
     private var session: Session? = null
     private var installRequested = false
@@ -75,6 +78,15 @@ class MainActivity : AppCompatActivity(), GLSurfaceView.Renderer {
         }
     }
 
+    private val blePermissionLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestMultiplePermissions()
+    ) { permissions ->
+        val allGranted = permissions.entries.all { it.value }
+        if (allGranted) {
+            bleGloveController.startScan()
+        }
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
@@ -83,17 +95,28 @@ class MainActivity : AppCompatActivity(), GLSurfaceView.Renderer {
         glSurfaceView = findViewById(R.id.glSurfaceView)
         overlayView = findViewById(R.id.overlayView)
         statusBanner = findViewById(R.id.statusBanner)
+        bleStatusBadge = findViewById(R.id.bleStatusBadge)
         muteButton = findViewById(R.id.muteButton)
         hapticController = HapticController(this)
+        bleGloveController = BleGloveController(this)
+        bleGloveController.onStateChangedListener = { state ->
+            updateBleBadge(state)
+        }
 
         muteButton.setOnClickListener {
             hapticController.isMuted = !hapticController.isMuted
             if (hapticController.isMuted) {
                 muteButton.text = "UNMUTE HAPTICS"
                 muteButton.setBackgroundColor("#B71C1C".toColorInt())
+                val currentText = statusBanner.text.toString()
+                if (!currentText.endsWith("(MUTED)")) {
+                    statusBanner.text = "$currentText (MUTED)"
+                }
             } else {
                 muteButton.text = "MUTE HAPTICS"
                 muteButton.setBackgroundColor("#212121".toColorInt())
+                val currentText = statusBanner.text.toString()
+                statusBanner.text = currentText.removeSuffix(" (MUTED)")
                 hapticController.triggerTestPulse()
             }
         }
@@ -105,6 +128,55 @@ class MainActivity : AppCompatActivity(), GLSurfaceView.Renderer {
         glSurfaceView.renderMode = GLSurfaceView.RENDERMODE_CONTINUOUSLY
     }
 
+    private fun updateBleBadge(state: BleConnectionState) {
+        runOnUiThread {
+            when (state) {
+                BleConnectionState.CONNECTED -> {
+                    bleStatusBadge.text = "🧤 GLOVE: CONNECTED"
+                    bleStatusBadge.setTextColor("#00E676".toColorInt())
+                    bleStatusBadge.setBackgroundColor("#D91B5E20".toColorInt())
+                }
+                BleConnectionState.CONNECTING -> {
+                    bleStatusBadge.text = "🧤 GLOVE: CONNECTING"
+                    bleStatusBadge.setTextColor("#FFB74D".toColorInt())
+                    bleStatusBadge.setBackgroundColor("#D9E65100".toColorInt())
+                }
+                BleConnectionState.SCANNING -> {
+                    bleStatusBadge.text = "🧤 GLOVE: SCANNING"
+                    bleStatusBadge.setTextColor("#80D8FF".toColorInt())
+                    bleStatusBadge.setBackgroundColor("#D9212121".toColorInt())
+                }
+                BleConnectionState.DISCONNECTED -> {
+                    bleStatusBadge.text = "🧤 PHONE HAPTICS"
+                    bleStatusBadge.setTextColor("#B0BEC5".toColorInt())
+                    bleStatusBadge.setBackgroundColor("#D9212121".toColorInt())
+                }
+            }
+        }
+    }
+
+    private fun checkAndRequestBlePermissions() {
+        val permissionsToRequest = mutableListOf<String>()
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            if (ContextCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_SCAN) != PackageManager.PERMISSION_GRANTED) {
+                permissionsToRequest.add(Manifest.permission.BLUETOOTH_SCAN)
+            }
+            if (ContextCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_CONNECT) != PackageManager.PERMISSION_GRANTED) {
+                permissionsToRequest.add(Manifest.permission.BLUETOOTH_CONNECT)
+            }
+        } else {
+            if (ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
+                permissionsToRequest.add(Manifest.permission.ACCESS_FINE_LOCATION)
+            }
+        }
+
+        if (permissionsToRequest.isNotEmpty()) {
+            blePermissionLauncher.launch(permissionsToRequest.toTypedArray())
+        } else {
+            bleGloveController.startScan()
+        }
+    }
+
     override fun onResume() {
         super.onResume()
         sessionResumeTimestamp = SystemClock.elapsedRealtime()
@@ -114,6 +186,7 @@ class MainActivity : AppCompatActivity(), GLSurfaceView.Renderer {
         skipFrames = 0
         hapticController.startSession()
         depthAnalyzer.reset()
+        checkAndRequestBlePermissions()
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA)
             != PackageManager.PERMISSION_GRANTED
         ) {
@@ -139,13 +212,18 @@ class MainActivity : AppCompatActivity(), GLSurfaceView.Renderer {
 
                 val newSession = Session(this)
 
-                // Select the widest rear camera config supported by ARCore
+                // Select balanced 30 FPS camera config supported by ARCore to eliminate overheating
                 try {
-                    val filter = CameraConfigFilter(newSession).setFacingDirection(CameraConfig.FacingDirection.BACK)
+                    val filter = CameraConfigFilter(newSession)
+                        .setFacingDirection(CameraConfig.FacingDirection.BACK)
+                        .setTargetFps(EnumSet.of(CameraConfig.TargetFps.TARGET_FPS_30))
                     val supportedConfigs = newSession.getSupportedCameraConfigs(filter)
-                    val widestConfig = supportedConfigs.maxByOrNull { it.imageSize.width * it.imageSize.height }
-                    if (widestConfig != null) {
-                        newSession.cameraConfig = widestConfig
+                    val bestConfig = supportedConfigs.minByOrNull {
+                        val pixels = it.imageSize.width * it.imageSize.height
+                        Math.abs(pixels - (1280 * 720))
+                    } ?: supportedConfigs.firstOrNull()
+                    if (bestConfig != null) {
+                        newSession.cameraConfig = bestConfig
                     }
                 } catch (e: Exception) {
                     Log.e("HaptiSight", "Error configuring camera config", e)
@@ -153,7 +231,7 @@ class MainActivity : AppCompatActivity(), GLSurfaceView.Renderer {
 
                 val config = Config(newSession)
 
-                // Configure AUTOMATIC depth mode with fallback to RAW_DEPTH_ONLY
+                // Enable AUTOMATIC depth mode with fallback to RAW_DEPTH_ONLY
                 if (newSession.isDepthModeSupported(Config.DepthMode.AUTOMATIC)) {
                     config.depthMode = Config.DepthMode.AUTOMATIC
                 } else if (newSession.isDepthModeSupported(Config.DepthMode.RAW_DEPTH_ONLY)) {
@@ -210,6 +288,8 @@ class MainActivity : AppCompatActivity(), GLSurfaceView.Renderer {
 
     override fun onPause() {
         super.onPause()
+        bleGloveController.sendPacket("000N")
+        bleGloveController.stopScan()
         hapticController.stopAll()
         glSurfaceView.onPause()
         session?.pause()
@@ -219,6 +299,7 @@ class MainActivity : AppCompatActivity(), GLSurfaceView.Renderer {
 
     override fun onDestroy() {
         super.onDestroy()
+        bleGloveController.close()
         hapticController.stopAll()
         session?.close()
         session = null
@@ -267,27 +348,9 @@ class MainActivity : AppCompatActivity(), GLSurfaceView.Renderer {
         // 1. Draw camera feed onto full-screen surface with zero black bars (smooth 60 FPS)
         backgroundRenderer.draw(frame)
 
-        // 2. Camera Tracking State Check (State 5: Camera/Tracking Error)
+        // 2. Camera Tracking State Info
         val camera = frame.camera
-        if (camera.trackingState != TrackingState.TRACKING) {
-            hapticController.stopAll()
-            lastValidDepthTimestamp = 0L
-            depthAnalyzer.reset()
-            val failureReason = camera.trackingFailureReason
-            val trackingMessage = when (failureReason) {
-                TrackingFailureReason.INSUFFICIENT_LIGHT -> "⚠️ TRACKING PAUSED - TOO DARK"
-                TrackingFailureReason.EXCESSIVE_MOTION -> "⚠️ TRACKING PAUSED - MOVING TOO FAST"
-                TrackingFailureReason.INSUFFICIENT_FEATURES -> "⚠️ TRACKING PAUSED - POOR TEXTURE"
-                TrackingFailureReason.CAMERA_UNAVAILABLE -> "⚠️ CAMERA UNAVAILABLE"
-                TrackingFailureReason.BAD_STATE -> "⚠️ TRACKING ERROR"
-                else -> "⚠️ TRACKING PAUSED - MOVE PHONE SLOWLY"
-            }
-            runOnUiThread {
-                overlayView.clear()
-                statusBanner.text = trackingMessage
-            }
-            return
-        }
+        val isTracking = (camera.trackingState == TrackingState.TRACKING)
 
         // 3. Recovery check after ResourceExhaustedException
         if (skipFrames > 0) {
@@ -302,17 +365,35 @@ class MainActivity : AppCompatActivity(), GLSurfaceView.Renderer {
         }
         lastFrameTimestamp = frameTimestamp
 
-        // 5. Throttle depth analysis to once every 60ms (~16 FPS) for instantaneous zero-lag response
+        // 5. Throttle depth analysis to once every 80ms (~12.5 FPS) for cool, sustainable operation
         val now = SystemClock.elapsedRealtime()
-        if (now - lastAnalysisTime < 60L) {
+        if (now - lastAnalysisTime < 80L) {
             // Check stale depth timeout (800ms) or initial depth acquisition timeout (800ms)
             val isDepthStale = (lastValidDepthTimestamp > 0L && (now - lastValidDepthTimestamp > 800L)) ||
                     (lastValidDepthTimestamp == 0L && (now - sessionResumeTimestamp > 800L))
             if (isDepthStale) {
                 hapticController.stopAll()
+                bleGloveController.sendPacket("000N")
+                val staleMessage = if (!isTracking) {
+                    when (camera.trackingFailureReason) {
+                        TrackingFailureReason.INSUFFICIENT_LIGHT -> "⚠️ TRACKING PAUSED - TOO DARK"
+                        TrackingFailureReason.EXCESSIVE_MOTION -> "⚠️ TRACKING PAUSED - MOVING TOO FAST"
+                        TrackingFailureReason.INSUFFICIENT_FEATURES -> "⚠️ TRACKING PAUSED - POOR TEXTURE"
+                        else -> "⚠️ TRACKING PAUSED - MOVE PHONE SLOWLY"
+                    }
+                } else {
+                    "⚠️ DEPTH UNAVAILABLE"
+                }
                 runOnUiThread {
-                    overlayView.clear()
-                    statusBanner.text = "⚠️ DEPTH UNAVAILABLE"
+                    overlayView.setDetectionResult(
+                        boxes = emptyList(),
+                        leftActive = false,
+                        centerActive = false,
+                        rightActive = false,
+                        motorPatternCode = "000N",
+                        latencyMs = 0f
+                    )
+                    statusBanner.text = staleMessage
                 }
             } else {
                 hapticController.checkWatchdog()
@@ -323,20 +404,58 @@ class MainActivity : AppCompatActivity(), GLSurfaceView.Renderer {
 
         // 6. Synchronous Hybrid Depth Analysis on GLThread (< 1.5ms)
         try {
+            val startTimeNs = System.nanoTime()
             val result = depthAnalyzer.analyze(frame)
-            if (!result.isDepthUnavailable && !result.lowConfidence && (result.isSafePath || result.boxes.isNotEmpty())) {
+            val latencyMs = (System.nanoTime() - startTimeNs) / 1_000_000.0f
+            if (!result.isDepthUnavailable) {
                 lastValidDepthTimestamp = now
             }
-            val bannerText = hapticController.onDetectionUpdated(result)
+
+            // Transmit packet to BLE glove
+            bleGloveController.sendPacket(result.motorPatternCode)
+
+            // Fallback to phone vibration when disconnected
+            val bannerText = if (bleGloveController.isConnected) {
+                hapticController.cancel()
+                result.bannerText
+            } else {
+                hapticController.onDetectionUpdated(result)
+            }
             val boxesCopy = result.boxes.toList()
+
+            // If tracking is paused and depth is unavailable or low confidence, inform the user
+            val displayBanner = if (!isTracking && (result.isDepthUnavailable || result.lowConfidence)) {
+                when (camera.trackingFailureReason) {
+                    TrackingFailureReason.INSUFFICIENT_LIGHT -> "⚠️ TRACKING PAUSED - TOO DARK"
+                    TrackingFailureReason.EXCESSIVE_MOTION -> "⚠️ TRACKING PAUSED - MOVING TOO FAST"
+                    TrackingFailureReason.INSUFFICIENT_FEATURES -> "⚠️ TRACKING PAUSED - POOR TEXTURE"
+                    else -> "⚠️ TRACKING PAUSED - MOVE PHONE SLOWLY"
+                }
+            } else {
+                bannerText
+            }
 
             runOnUiThread {
                 if (result.isDepthUnavailable || result.lowConfidence || (!result.isSafePath && result.boxes.isEmpty())) {
-                    overlayView.clear()
+                    overlayView.setDetectionResult(
+                        boxes = emptyList(),
+                        leftActive = false,
+                        centerActive = false,
+                        rightActive = false,
+                        motorPatternCode = "000N",
+                        latencyMs = latencyMs
+                    )
                 } else {
-                    overlayView.setDetectionResult(boxesCopy)
+                    overlayView.setDetectionResult(
+                        boxes = boxesCopy,
+                        leftActive = result.leftBlocked,
+                        centerActive = result.centerBlocked,
+                        rightActive = result.rightBlocked,
+                        motorPatternCode = result.motorPatternCode,
+                        latencyMs = latencyMs
+                    )
                 }
-                statusBanner.text = bannerText
+                statusBanner.text = displayBanner
             }
         } catch (e: ResourceExhaustedException) {
             Log.e("HaptiSight", "ResourceExhaustedException in depth analysis", e)
@@ -348,8 +467,16 @@ class MainActivity : AppCompatActivity(), GLSurfaceView.Renderer {
                     (lastValidDepthTimestamp == 0L && (now - sessionResumeTimestamp > 800L))
             if (isDepthStale) {
                 hapticController.stopAll()
+                bleGloveController.sendPacket("000N")
                 runOnUiThread {
-                    overlayView.clear()
+                    overlayView.setDetectionResult(
+                        boxes = emptyList(),
+                        leftActive = false,
+                        centerActive = false,
+                        rightActive = false,
+                        motorPatternCode = "000N",
+                        latencyMs = 0f
+                    )
                     statusBanner.text = "⚠️ DEPTH UNAVAILABLE"
                 }
             }

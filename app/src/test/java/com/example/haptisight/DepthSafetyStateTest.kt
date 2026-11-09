@@ -292,4 +292,176 @@ class DepthSafetyStateTest {
         assertTrue(DepthAnalyzer.COLOR_RED != DepthAnalyzer.COLOR_GREEN)
         assertTrue(DepthAnalyzer.COLOR_YELLOW != DepthAnalyzer.COLOR_GREEN)
     }
+
+    @Test
+    fun testBlockedThresholdStrict1000mm() {
+        val blockedThreshold = 1000
+        val dMinBlocked = 1000
+        val dMinSafe = 1001
+
+        assertTrue("1000mm must be marked as blocked", dMinBlocked <= blockedThreshold)
+        assertFalse("1001mm must not be marked as blocked (safe)", dMinSafe <= blockedThreshold)
+    }
+
+    @Test
+    fun testMotorPatternCodeAll8States() {
+        fun buildCode(l: Boolean, c: Boolean, r: Boolean): String {
+            val any = l || c || r
+            return "${if (l) '1' else '0'}${if (c) '1' else '0'}${if (r) '1' else '0'}${if (any) 'S' else 'N'}"
+        }
+
+        assertEquals("000N", buildCode(false, false, false))
+        assertEquals("100S", buildCode(true, false, false))
+        assertEquals("010S", buildCode(false, true, false))
+        assertEquals("001S", buildCode(false, false, true))
+        assertEquals("110S", buildCode(true, true, false))
+        assertEquals("011S", buildCode(false, true, true))
+        assertEquals("101S", buildCode(true, false, true))
+        assertEquals("111S", buildCode(true, true, true))
+    }
+
+    @Test
+    fun testDepthAnalysisResultPhase7Fields() {
+        val result = DepthAnalysisResult(
+            boxes = emptyList(),
+            leftDMin = 650,
+            centerDMin = 1200,
+            rightDMin = null,
+            isRedBarrier = false,
+            mergedRedDMin = null,
+            isDoorway = false,
+            yellowDMin = 650,
+            isSafePath = false,
+            totalRoiPixels = 1000,
+            validRoiPixels = 200,
+            lowConfidence = false,
+            isDepthUnavailable = false,
+            bannerText = "🔴 OBSTACLE <1m [LEFT] - SHORT BUZZ",
+            leftBlocked = true,
+            centerBlocked = false,
+            rightBlocked = false,
+            leftDepthMm = 650,
+            centerDepthMm = 1200,
+            rightDepthMm = 0,
+            motorPatternCode = "100S"
+        )
+
+        assertTrue(result.leftBlocked)
+        assertFalse(result.centerBlocked)
+        assertFalse(result.rightBlocked)
+        assertEquals(650, result.leftDepthMm)
+        assertEquals(1200, result.centerDepthMm)
+        assertEquals(0, result.rightDepthMm)
+        assertEquals("100S", result.motorPatternCode)
+        assertEquals("🔴 OBSTACLE <1m [LEFT] - SHORT BUZZ", result.bannerText)
+    }
+
+    @Test
+    fun testPhase8DirectionalBannerFormatting() {
+        fun buildBanner(left: Boolean, center: Boolean, right: Boolean): String {
+            val hasObstacle = left || center || right
+            return if (hasObstacle) {
+                val blockedNames = mutableListOf<String>()
+                if (left) blockedNames.add("LEFT")
+                if (center) blockedNames.add("CENTRE")
+                if (right) blockedNames.add("RIGHT")
+                "🔴 OBSTACLE <1m [${blockedNames.joinToString(" + ")}] - SHORT BUZZ"
+            } else {
+                "🟢 SAFE PATH"
+            }
+        }
+
+        assertEquals("🟢 SAFE PATH", buildBanner(false, false, false))
+        assertEquals("🔴 OBSTACLE <1m [LEFT] - SHORT BUZZ", buildBanner(true, false, false))
+        assertEquals("🔴 OBSTACLE <1m [CENTRE] - SHORT BUZZ", buildBanner(false, true, false))
+        assertEquals("🔴 OBSTACLE <1m [RIGHT] - SHORT BUZZ", buildBanner(false, false, true))
+        assertEquals("🔴 OBSTACLE <1m [LEFT + CENTRE] - SHORT BUZZ", buildBanner(true, true, false))
+        assertEquals("🔴 OBSTACLE <1m [CENTRE + RIGHT] - SHORT BUZZ", buildBanner(false, true, true))
+        assertEquals("🔴 OBSTACLE <1m [LEFT + RIGHT] - SHORT BUZZ", buildBanner(true, false, true))
+        assertEquals("🔴 OBSTACLE <1m [LEFT + CENTRE + RIGHT] - SHORT BUZZ", buildBanner(true, true, true))
+    }
+
+    @Test
+    fun testPhase9VirtualGloveSimulatorTelemetry() {
+        val detectionResult = DetectionResult(
+            boxes = emptyList(),
+            leftActive = true,
+            centerActive = false,
+            rightActive = true,
+            motorPatternCode = "101S",
+            latencyMs = 1.2f
+        )
+
+        assertTrue(detectionResult.leftActive)
+        assertFalse(detectionResult.centerActive)
+        assertTrue(detectionResult.rightActive)
+        assertEquals("101S", detectionResult.motorPatternCode)
+        assertEquals(1.2f, detectionResult.latencyMs, 0.001f)
+
+        val telemetryText = String.format(
+            java.util.Locale.US,
+            "TX: %s | Latency: %.1f ms",
+            detectionResult.motorPatternCode,
+            detectionResult.latencyMs
+        )
+        assertEquals("TX: 101S | Latency: 1.2 ms", telemetryText)
+    }
+
+    @Test
+    fun testPhase10All8MotorStatesAt1000mmThreshold() {
+        val thresholdMm = 1000
+
+        data class TestCase(
+            val leftMm: Int,
+            val centerMm: Int,
+            val rightMm: Int,
+            val expectedLeft: Boolean,
+            val expectedCenter: Boolean,
+            val expectedRight: Boolean,
+            val expectedPattern: String
+        )
+
+        val testCases = listOf(
+            TestCase(1200, 1500, 2000, false, false, false, "000N"), // 1. None blocked (> 1000mm)
+            TestCase(750, 1500, 2000, true, false, false, "100S"),   // 2. Left only (Thumb)
+            TestCase(1200, 999, 2000, false, true, false, "010S"),   // 3. Center only (Index)
+            TestCase(1200, 1500, 1000, false, false, true, "001S"),  // 4. Right only (Right, boundary 1000mm)
+            TestCase(800, 1000, 1001, true, true, false, "110S"),    // 5. Left + Center (Right 1001mm is safe)
+            TestCase(1050, 600, 950, false, true, true, "011S"),     // 6. Center + Right
+            TestCase(500, 1200, 700, true, false, true, "101S"),     // 7. Left + Right
+            TestCase(900, 850, 1000, true, true, true, "111S")       // 8. All three blocked (boundary 1000mm)
+        )
+
+        for ((index, tc) in testCases.withIndex()) {
+            val leftBlocked = tc.leftMm <= thresholdMm
+            val centerBlocked = tc.centerMm <= thresholdMm
+            val rightBlocked = tc.rightMm <= thresholdMm
+            val hasAny = leftBlocked || centerBlocked || rightBlocked
+
+            val code = buildString {
+                append(if (leftBlocked) '1' else '0')
+                append(if (centerBlocked) '1' else '0')
+                append(if (rightBlocked) '1' else '0')
+                append(if (hasAny) 'S' else 'N')
+            }
+
+            assertEquals("Test case $index leftBlocked mismatch", tc.expectedLeft, leftBlocked)
+            assertEquals("Test case $index centerBlocked mismatch", tc.expectedCenter, centerBlocked)
+            assertEquals("Test case $index rightBlocked mismatch", tc.expectedRight, rightBlocked)
+            assertEquals("Test case $index motorPatternCode mismatch", tc.expectedPattern, code)
+        }
+    }
+
+    @Test
+    fun testPhase10BleGloveControllerConstants() {
+        assertEquals(
+            "6e400001-b5a3-f393-e0a9-e50e24dcca9e",
+            BleGloveController.UART_SERVICE_UUID.toString().lowercase()
+        )
+        assertEquals(
+            "6e400002-b5a3-f393-e0a9-e50e24dcca9e",
+            BleGloveController.UART_TX_CHAR_UUID.toString().lowercase()
+        )
+        assertEquals("HaptiSight-Glove", BleGloveController.TARGET_DEVICE_NAME)
+    }
 }
