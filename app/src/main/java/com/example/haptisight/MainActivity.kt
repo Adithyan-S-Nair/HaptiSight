@@ -39,6 +39,11 @@ import javax.microedition.khronos.opengles.GL10
 @SuppressLint("SetTextI18n")
 class MainActivity : AppCompatActivity(), GLSurfaceView.Renderer {
 
+    companion object {
+        // Glove warning ticks are suppressed while depth initializes after launch/resume.
+        private const val UNCERTAIN_STARTUP_GRACE_MS = 3000L
+    }
+
     private lateinit var glSurfaceView: GLSurfaceView
     private lateinit var overlayView: OverlayView
     private lateinit var statusBanner: TextView
@@ -51,6 +56,9 @@ class MainActivity : AppCompatActivity(), GLSurfaceView.Renderer {
     private var installRequested = false
     private val backgroundRenderer = CameraBackgroundRenderer()
     private val depthAnalyzer = DepthAnalyzer()
+    private val stabilizer = StateStabilizer()
+    @Volatile private var lastBanner: String = ""
+    @Volatile private var lastSentPacket: String = StateStabilizer.PACKET_SAFE
 
     private var lastAnalysisTime: Long = 0L
     private var lastFrameTimestamp: Long = 0L
@@ -185,6 +193,8 @@ class MainActivity : AppCompatActivity(), GLSurfaceView.Renderer {
         lastFrameTimestamp = 0L
         skipFrames = 0
         hapticController.startSession()
+        stabilizer.reset()
+        lastBanner = ""
         depthAnalyzer.reset()
         checkAndRequestBlePermissions()
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA)
@@ -290,6 +300,7 @@ class MainActivity : AppCompatActivity(), GLSurfaceView.Renderer {
         super.onPause()
         bleGloveController.sendPacket("000N")
         bleGloveController.stopScan()
+        stabilizer.reset()
         hapticController.stopAll()
         glSurfaceView.onPause()
         session?.pause()
@@ -348,9 +359,11 @@ class MainActivity : AppCompatActivity(), GLSurfaceView.Renderer {
         // 1. Draw camera feed onto full-screen surface with zero black bars (smooth 60 FPS)
         backgroundRenderer.draw(frame)
 
-        // 2. Camera Tracking State Info
+        // 2. Camera Tracking State Info.
+        // Obstacle detection keeps running without tracking, but SAFE is never confirmed without it.
         val camera = frame.camera
         val isTracking = (camera.trackingState == TrackingState.TRACKING)
+        val trackingMessage: String? = if (isTracking) null else trackingMessageFor(camera.trackingFailureReason)
 
         // 3. Recovery check after ResourceExhaustedException
         if (skipFrames > 0) {
@@ -368,33 +381,8 @@ class MainActivity : AppCompatActivity(), GLSurfaceView.Renderer {
         // 5. Throttle depth analysis to once every 80ms (~12.5 FPS) for cool, sustainable operation
         val now = SystemClock.elapsedRealtime()
         if (now - lastAnalysisTime < 80L) {
-            // Check stale depth timeout (800ms) or initial depth acquisition timeout (800ms)
-            val isDepthStale = (lastValidDepthTimestamp > 0L && (now - lastValidDepthTimestamp > 800L)) ||
-                    (lastValidDepthTimestamp == 0L && (now - sessionResumeTimestamp > 800L))
-            if (isDepthStale) {
-                hapticController.stopAll()
-                bleGloveController.sendPacket("000N")
-                val staleMessage = if (!isTracking) {
-                    when (camera.trackingFailureReason) {
-                        TrackingFailureReason.INSUFFICIENT_LIGHT -> "⚠️ TRACKING PAUSED - TOO DARK"
-                        TrackingFailureReason.EXCESSIVE_MOTION -> "⚠️ TRACKING PAUSED - MOVING TOO FAST"
-                        TrackingFailureReason.INSUFFICIENT_FEATURES -> "⚠️ TRACKING PAUSED - POOR TEXTURE"
-                        else -> "⚠️ TRACKING PAUSED - MOVE PHONE SLOWLY"
-                    }
-                } else {
-                    "⚠️ DEPTH UNAVAILABLE"
-                }
-                runOnUiThread {
-                    overlayView.setDetectionResult(
-                        boxes = emptyList(),
-                        leftActive = false,
-                        centerActive = false,
-                        rightActive = false,
-                        motorPatternCode = "000N",
-                        latencyMs = 0f
-                    )
-                    statusBanner.text = staleMessage
-                }
+            if (isDepthStale(now)) {
+                publishStale(trackingMessage ?: "⚠️ DEPTH UNAVAILABLE", now)
             } else {
                 hapticController.checkWatchdog()
             }
@@ -402,7 +390,7 @@ class MainActivity : AppCompatActivity(), GLSurfaceView.Renderer {
         }
         lastAnalysisTime = now
 
-        // 6. Synchronous Hybrid Depth Analysis on GLThread (< 1.5ms)
+        // 6. Synchronous Hybrid Depth Analysis on GLThread, then temporal stabilization
         try {
             val startTimeNs = System.nanoTime()
             val result = depthAnalyzer.analyze(frame)
@@ -411,51 +399,23 @@ class MainActivity : AppCompatActivity(), GLSurfaceView.Renderer {
                 lastValidDepthTimestamp = now
             }
 
-            // Transmit packet to BLE glove
-            bleGloveController.sendPacket(result.motorPatternCode)
-
-            // Fallback to phone vibration when disconnected
-            val bannerText = if (bleGloveController.isConnected) {
-                hapticController.cancel()
-                result.bannerText
-            } else {
-                hapticController.onDetectionUpdated(result)
-            }
-            val boxesCopy = result.boxes.toList()
-
-            // If tracking is paused and depth is unavailable or low confidence, inform the user
-            val displayBanner = if (!isTracking && (result.isDepthUnavailable || result.lowConfidence)) {
-                when (camera.trackingFailureReason) {
-                    TrackingFailureReason.INSUFFICIENT_LIGHT -> "⚠️ TRACKING PAUSED - TOO DARK"
-                    TrackingFailureReason.EXCESSIVE_MOTION -> "⚠️ TRACKING PAUSED - MOVING TOO FAST"
-                    TrackingFailureReason.INSUFFICIENT_FEATURES -> "⚠️ TRACKING PAUSED - POOR TEXTURE"
-                    else -> "⚠️ TRACKING PAUSED - MOVE PHONE SLOWLY"
-                }
-            } else {
-                bannerText
-            }
+            val output = stabilizer.onAnalysis(result, trackingMessage, now)
+            val bannerText = deliver(output, now)
+            val showBoxes = (output.verdict != Verdict.UNCERTAIN)
+            val boxesCopy = if (showBoxes) result.boxes.toList() else emptyList()
+            val hudPacket = lastSentPacket
+            lastBanner = bannerText
 
             runOnUiThread {
-                if (result.isDepthUnavailable || result.lowConfidence || (!result.isSafePath && result.boxes.isEmpty())) {
-                    overlayView.setDetectionResult(
-                        boxes = emptyList(),
-                        leftActive = false,
-                        centerActive = false,
-                        rightActive = false,
-                        motorPatternCode = "000N",
-                        latencyMs = latencyMs
-                    )
-                } else {
-                    overlayView.setDetectionResult(
-                        boxes = boxesCopy,
-                        leftActive = result.leftBlocked,
-                        centerActive = result.centerBlocked,
-                        rightActive = result.rightBlocked,
-                        motorPatternCode = result.motorPatternCode,
-                        latencyMs = latencyMs
-                    )
-                }
-                statusBanner.text = displayBanner
+                overlayView.setDetectionResult(
+                    boxes = boxesCopy,
+                    leftActive = output.leftOn,
+                    centerActive = output.centerOn,
+                    rightActive = output.rightOn,
+                    motorPatternCode = hudPacket,
+                    latencyMs = latencyMs
+                )
+                statusBanner.text = bannerText
             }
         } catch (e: ResourceExhaustedException) {
             Log.e("HaptiSight", "ResourceExhaustedException in depth analysis", e)
@@ -463,22 +423,69 @@ class MainActivity : AppCompatActivity(), GLSurfaceView.Renderer {
             skipFrames = 2
         } catch (e: Exception) {
             Log.e("HaptiSight", "Depth frame processing exception", e)
-            val isDepthStale = (lastValidDepthTimestamp > 0L && (now - lastValidDepthTimestamp > 800L)) ||
-                    (lastValidDepthTimestamp == 0L && (now - sessionResumeTimestamp > 800L))
-            if (isDepthStale) {
-                hapticController.stopAll()
-                bleGloveController.sendPacket("000N")
-                runOnUiThread {
-                    overlayView.setDetectionResult(
-                        boxes = emptyList(),
-                        leftActive = false,
-                        centerActive = false,
-                        rightActive = false,
-                        motorPatternCode = "000N",
-                        latencyMs = 0f
-                    )
-                    statusBanner.text = "⚠️ DEPTH UNAVAILABLE"
-                }
+            if (isDepthStale(now)) {
+                publishStale(trackingMessage ?: "⚠️ DEPTH UNAVAILABLE", now)
+            }
+        }
+    }
+
+    private fun trackingMessageFor(reason: TrackingFailureReason): String {
+        return when (reason) {
+            TrackingFailureReason.INSUFFICIENT_LIGHT -> "⚠️ TRACKING PAUSED - TOO DARK"
+            TrackingFailureReason.EXCESSIVE_MOTION -> "⚠️ TRACKING PAUSED - MOVING TOO FAST"
+            TrackingFailureReason.INSUFFICIENT_FEATURES -> "⚠️ TRACKING PAUSED - POOR TEXTURE"
+            else -> "⚠️ TRACKING PAUSED - MOVE PHONE SLOWLY"
+        }
+    }
+
+    /** Same rule as before: no depth for 800 ms (or none at all 800 ms after session start). */
+    private fun isDepthStale(now: Long): Boolean {
+        return (lastValidDepthTimestamp > 0L && (now - lastValidDepthTimestamp > 800L)) ||
+                (lastValidDepthTimestamp == 0L && (now - sessionResumeTimestamp > 800L))
+    }
+
+    /**
+     * Sends the decision to the glove (BLE packet) or the phone vibrator and returns the banner text.
+     *  - glove packets: "xxxS" obstacle, "000N" safe/silent, "000U" uncertain warning
+     *  - uncertain warnings are held back during startup and while muted
+     */
+    private fun deliver(output: StableOutput, now: Long): String {
+        val startupDone = (now - sessionResumeTimestamp) >= UNCERTAIN_STARTUP_GRACE_MS
+        val packet = if (hapticController.isMuted) {
+            StateStabilizer.PACKET_SAFE
+        } else if (output.verdict == Verdict.UNCERTAIN && !(output.signalUncertain && startupDone)) {
+            StateStabilizer.PACKET_SAFE
+        } else {
+            output.packet
+        }
+        lastSentPacket = packet
+        bleGloveController.sendPacket(packet)
+
+        return if (bleGloveController.isConnected) {
+            hapticController.cancel()
+            if (hapticController.isMuted) "${output.banner} (MUTED)" else output.banner
+        } else {
+            hapticController.onStableOutput(output)
+        }
+    }
+
+    /** Depth stale: report UNCERTAIN immediately. UI is only touched when the text changes. */
+    private fun publishStale(text: String, now: Long) {
+        val output = stabilizer.onStale(text)
+        val bannerText = deliver(output, now)
+        if (bannerText != lastBanner) {
+            lastBanner = bannerText
+            val hudPacket = lastSentPacket
+            runOnUiThread {
+                overlayView.setDetectionResult(
+                    boxes = emptyList(),
+                    leftActive = false,
+                    centerActive = false,
+                    rightActive = false,
+                    motorPatternCode = hudPacket,
+                    latencyMs = 0f
+                )
+                statusBanner.text = bannerText
             }
         }
     }

@@ -11,6 +11,7 @@ import android.util.Log
 enum class HapticState {
     SAFE,
     ACTIVE_OBSTACLE,
+    UNCERTAIN,
     @Deprecated("Legacy state retained for compatibility")
     SINGLE_OBSTACLE,
     @Deprecated("Removed long buzz in Phase 8")
@@ -25,6 +26,17 @@ enum class HapticState {
  * Immediately calls vibrator.cancel() when all zones are > 1000 mm ("000N"), muted, low confidence, or stale.
  */
 class HapticController(context: Context) {
+
+    companion object {
+        // Set to false to restore the old behaviour (phone silent in uncertain states).
+        private const val SIGNAL_WHEN_UNCERTAIN = true
+        private const val STARTUP_GRACE_MS = 3000L
+        private const val UNCERTAIN_REPEAT_MS = 3000L
+
+        // Three short, light ticks: clearly different from the strong 200 ms obstacle buzz.
+        private val UNCERTAIN_TIMINGS = longArrayOf(0, 60, 90, 60, 90, 60)
+        private val UNCERTAIN_AMPLITUDES = intArrayOf(0, 140, 0, 140, 0, 140)
+    }
 
     private val vibrator: Vibrator = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
         val vibratorManager = context.getSystemService(Context.VIBRATOR_MANAGER_SERVICE) as? VibratorManager
@@ -47,6 +59,8 @@ class HapticController(context: Context) {
     private var currentCooldownMs: Long = 0L
     private var lastObstacleDetectedTimeMs: Long = 0L
     private var lastState: HapticState = HapticState.SAFE
+    private var lastUncertainSignalMs: Long = 0L
+    private var sessionStartMs: Long = 0L
 
     /**
      * Resets session timing when camera/tracking starts or resumes.
@@ -56,6 +70,8 @@ class HapticController(context: Context) {
         currentCooldownMs = 0L
         lastObstacleDetectedTimeMs = 0L
         lastState = HapticState.SAFE
+        lastUncertainSignalMs = 0L
+        sessionStartMs = SystemClock.uptimeMillis()
     }
 
     /**
@@ -85,9 +101,9 @@ class HapticController(context: Context) {
      */
     fun checkWatchdog(): Boolean {
         val now = SystemClock.uptimeMillis()
-        if (lastState != HapticState.SAFE && (now - lastObstacleDetectedTimeMs >= 400L)) {
+        if (lastState == HapticState.ACTIVE_OBSTACLE && (now - lastObstacleDetectedTimeMs >= 400L)) {
             cancel()
-            lastState = HapticState.SAFE
+            lastState = HapticState.UNCERTAIN
             return true
         }
         return false
@@ -107,70 +123,54 @@ class HapticController(context: Context) {
     }
 
     /**
-     * Compatibility alias for onDetectionUpdated.
-     */
-    fun processResult(result: DepthAnalysisResult): String = onDetectionUpdated(result)
-
-    /**
-     * Evaluates depth analysis result, triggers uniform Short Buzz (200ms ON / 300ms cooldown)
-     * if any zone is <= 1000 mm (motorPatternCode != "000N"), and returns the status banner text.
+     * Applies the stabilized decision from [StateStabilizer] and returns the banner text.
      *
-     * STRICT SAFETY & SILENCE RULES:
-     * - Trigger ONLY uniform Short Buzz (200 ms pulse with 300 ms cooldown at 255 amplitude)
-     *   whenever any zone is <= 1000 mm (motorPatternCode != "000N").
-     * - All Long Buzz waveforms are completely removed.
-     * - Immediately calls vibrator.cancel() when all zones are > 1000 mm ("000N"), muted,
-     *   low confidence, depth unavailable, or stale.
+     *  - ACTIVE    : uniform Short Buzz (200 ms ON / 300 ms cooldown) while any zone is blocked
+     *  - SAFE      : silence (running vibration is cancelled once)
+     *  - UNCERTAIN : obstacle vibration stops; if the uncertainty persists (signalUncertain) three
+     *                light ticks play at most every 3 s, so silence only ever means SAFE.
+     *                Ticks are suppressed for the first 3 s after launch.
      */
-    fun onDetectionUpdated(result: DepthAnalysisResult): String {
+    fun onStableOutput(output: StableOutput): String {
         val now = SystemClock.uptimeMillis()
 
-        // 1. MUTED: immediately cancel vibration and report muted status
         if (isMuted) {
             cancel()
             lastState = HapticState.SAFE
-            return "${result.bannerText} (MUTED)"
+            return "${output.banner} (MUTED)"
         }
 
-        // 2. STALE / UNAVAILABLE / LOW CONFIDENCE: immediately cancel vibration
-        if (result.isDepthUnavailable) {
-            cancel()
-            lastState = HapticState.SAFE
-            return "⚠️ DEPTH UNAVAILABLE"
-        }
+        when (output.verdict) {
+            Verdict.ACTIVE -> {
+                lastObstacleDetectedTimeMs = now
+                val entering = (lastState != HapticState.ACTIVE_OBSTACLE)
+                if (entering || (now - lastVibrationTimeMs >= currentCooldownMs)) {
+                    playOneShot(200L, 255, 300L, now)
+                }
+                lastState = HapticState.ACTIVE_OBSTACLE
+            }
+            Verdict.SAFE -> {
+                if (lastState != HapticState.SAFE) {
+                    cancel()
+                }
+                lastState = HapticState.SAFE
+            }
+            Verdict.UNCERTAIN -> {
+                if (lastState == HapticState.ACTIVE_OBSTACLE) {
+                    cancel()
+                }
+                lastState = HapticState.UNCERTAIN
 
-        if (result.lowConfidence || (!result.isSafePath && result.boxes.isEmpty() && result.motorPatternCode == "000N")) {
-            cancel()
-            lastState = HapticState.SAFE
-            return if (result.bannerText.isNotEmpty() && result.bannerText != "🟢 SAFE PATH") {
-                result.bannerText
-            } else {
-                "⚠️ LOW DEPTH CONFIDENCE"
+                val pastStartup = (now - sessionStartMs >= STARTUP_GRACE_MS)
+                val cooledDown = (lastUncertainSignalMs == 0L) ||
+                        (now - lastUncertainSignalMs >= UNCERTAIN_REPEAT_MS)
+                if (SIGNAL_WHEN_UNCERTAIN && output.signalUncertain && pastStartup && cooledDown) {
+                    playWaveform(UNCERTAIN_TIMINGS, UNCERTAIN_AMPLITUDES, UNCERTAIN_REPEAT_MS, now)
+                    lastUncertainSignalMs = now
+                }
             }
         }
-
-        // 3. ACTIVE OBSTACLE (<= 1000 mm / < 1.00m): Trigger ONLY uniform Short Buzz
-        val isObstacleActive = result.motorPatternCode != "000N" ||
-                result.leftBlocked || result.centerBlocked || result.rightBlocked
-
-        if (isObstacleActive) {
-            lastObstacleDetectedTimeMs = now
-            val stateTransitionFromSafe = (lastState == HapticState.SAFE)
-            if (stateTransitionFromSafe || (now - lastVibrationTimeMs >= currentCooldownMs)) {
-                // Uniform Short Buzz: 200 ms pulse with 300 ms cooldown at amplitude 255
-                playOneShot(200L, 255, 300L, now)
-            }
-            lastState = HapticState.ACTIVE_OBSTACLE
-            return result.bannerText
-        }
-
-        // 4. SAFE / ALL ZONES > 1000 mm ("000N"): Immediately cancel vibration once on transition and stay silent
-        if (lastState != HapticState.SAFE) {
-            cancel()
-            lastState = HapticState.SAFE
-        }
-
-        return if (result.isSafePath) "🟢 SAFE PATH" else result.bannerText
+        return output.banner
     }
 
     private fun playOneShot(durationMs: Long, amplitude: Int, cooldownMs: Long, now: Long) {
@@ -179,6 +179,15 @@ class HapticController(context: Context) {
         currentCooldownMs = cooldownMs
 
         val effect = VibrationEffect.createOneShot(durationMs, amplitude)
+        vibrateInternal(effect)
+    }
+
+    private fun playWaveform(timings: LongArray, amplitudes: IntArray, cooldownMs: Long, now: Long) {
+        if (!vibrator.hasVibrator()) return
+        lastVibrationTimeMs = now
+        currentCooldownMs = cooldownMs
+
+        val effect = VibrationEffect.createWaveform(timings, amplitudes, -1)
         vibrateInternal(effect)
     }
 
