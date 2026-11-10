@@ -464,4 +464,127 @@ class DepthSafetyStateTest {
         )
         assertEquals("HaptiSight-Glove", BleGloveController.TARGET_DEVICE_NAME)
     }
+
+    private fun createAnalysisResult(
+        leftBlocked: Boolean = false,
+        centerBlocked: Boolean = false,
+        rightBlocked: Boolean = false,
+        isSafePath: Boolean = false,
+        isDepthUnavailable: Boolean = false,
+        lowConfidence: Boolean = false,
+        bannerText: String = "TEST"
+    ) = DepthAnalysisResult(
+        boxes = emptyList(),
+        leftDMin = null,
+        centerDMin = null,
+        rightDMin = null,
+        isSafePath = isSafePath,
+        totalRoiPixels = 1000,
+        validRoiPixels = 500,
+        lowConfidence = lowConfidence,
+        isDepthUnavailable = isDepthUnavailable,
+        bannerText = bannerText,
+        leftBlocked = leftBlocked,
+        centerBlocked = centerBlocked,
+        rightBlocked = rightBlocked
+    )
+
+    @Test
+    fun testStateStabilizerPerZoneVotingHysteresis() {
+        val stabilizer = StateStabilizer()
+        val blockedLeft = createAnalysisResult(leftBlocked = true)
+        val clear = createAnalysisResult()
+
+        // 1. First 2 blocked frames: not yet stable (needs >= 3 votes)
+        var output = stabilizer.onAnalysis(blockedLeft, null, 100L)
+        assertEquals(Verdict.UNCERTAIN, output.verdict)
+        assertFalse(output.leftOn)
+
+        output = stabilizer.onAnalysis(blockedLeft, null, 200L)
+        assertEquals(Verdict.UNCERTAIN, output.verdict)
+        assertFalse(output.leftOn)
+
+        // 2. 3rd blocked frame: reaches 3 of 5 -> enters ACTIVE with leftOn = true, packet = "100S"
+        output = stabilizer.onAnalysis(blockedLeft, null, 300L)
+        assertEquals(Verdict.ACTIVE, output.verdict)
+        assertTrue(output.leftOn)
+        assertEquals("100S", output.packet)
+
+        // 3. Clear frame 1: votes = 3 (window has 3 blocked, 1 clear) -> still ACTIVE
+        output = stabilizer.onAnalysis(clear, null, 400L)
+        assertEquals(Verdict.ACTIVE, output.verdict)
+        assertTrue(output.leftOn)
+
+        // 4. Clear frame 2: votes = 3 (window has 3 blocked, 2 clear) -> still ACTIVE
+        output = stabilizer.onAnalysis(clear, null, 500L)
+        assertEquals(Verdict.ACTIVE, output.verdict)
+        assertTrue(output.leftOn)
+
+        // 5. Clear frame 3: votes = 2 (window has 2 blocked, 3 clear) -> hysteresis requires <= 1 vote to exit, so still ACTIVE!
+        output = stabilizer.onAnalysis(clear, null, 600L)
+        assertEquals(Verdict.ACTIVE, output.verdict)
+        assertTrue(output.leftOn)
+
+        // 6. Clear frame 4: votes = 1 (window has 1 blocked, 4 clear) -> votes <= 1, left turns OFF, drops out of ACTIVE
+        output = stabilizer.onAnalysis(clear, null, 700L)
+        assertFalse(output.leftOn)
+        assertEquals(Verdict.UNCERTAIN, output.verdict)
+    }
+
+    @Test
+    fun testStateStabilizerSafeRequiresTracking() {
+        val stabilizer = StateStabilizer()
+        val safeResult = createAnalysisResult(isSafePath = true)
+
+        // Feed 5 frames with safePath = true, but tracking paused (trackingMessage != null)
+        for (i in 1..5) {
+            val output = stabilizer.onAnalysis(safeResult, "⚠️ TRACKING PAUSED - MOVING TOO FAST", i * 100L)
+            assertEquals("Safe path must never be confirmed while tracking is paused", Verdict.UNCERTAIN, output.verdict)
+            assertEquals("000U", output.packet)
+        }
+
+        // Now tracking recovers (trackingMessage == null)
+        // Needs >= 4 of 5 frames to enter SAFE
+        for (i in 1..3) {
+            val output = stabilizer.onAnalysis(safeResult, null, (5 + i) * 100L)
+            assertEquals("Safe path requires 4 of 5 votes before entering SAFE", Verdict.UNCERTAIN, output.verdict)
+        }
+
+        // 4th frame with tracking OK: safeVotes = 4 >= 4 -> enters SAFE
+        val safeOutput = stabilizer.onAnalysis(safeResult, null, 900L)
+        assertEquals(Verdict.SAFE, safeOutput.verdict)
+        assertEquals("000N", safeOutput.packet)
+        assertEquals("🟢 SAFE PATH", safeOutput.banner)
+    }
+
+    @Test
+    fun testStateStabilizerUncertainPacketAndDelayedSignal() {
+        val stabilizer = StateStabilizer()
+        val unsureResult = createAnalysisResult(isSafePath = false)
+
+        // Initial frame: UNCERTAIN, signalUncertain is false (< 1000 ms)
+        val initial = stabilizer.onAnalysis(unsureResult, null, 1000L)
+        assertEquals(Verdict.UNCERTAIN, initial.verdict)
+        assertEquals("000U", initial.packet)
+        assertFalse(initial.signalUncertain)
+
+        // After 500 ms: still UNCERTAIN, signalUncertain is false
+        val mid = stabilizer.onAnalysis(unsureResult, null, 1500L)
+        assertEquals(Verdict.UNCERTAIN, mid.verdict)
+        assertEquals("000U", mid.packet)
+        assertFalse(mid.signalUncertain)
+
+        // After 1000 ms: signalUncertain becomes true
+        val delayed = stabilizer.onAnalysis(unsureResult, null, 2000L)
+        assertEquals(Verdict.UNCERTAIN, delayed.verdict)
+        assertEquals("000U", delayed.packet)
+        assertTrue(delayed.signalUncertain)
+
+        // onStale immediately returns 000U with signalUncertain = true
+        val stale = stabilizer.onStale("⚠️ DEPTH UNAVAILABLE")
+        assertEquals(Verdict.UNCERTAIN, stale.verdict)
+        assertEquals("000U", stale.packet)
+        assertTrue(stale.signalUncertain)
+        assertEquals("⚠️ DEPTH UNAVAILABLE", stale.banner)
+    }
 }
